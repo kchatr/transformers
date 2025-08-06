@@ -361,6 +361,7 @@ class RepetitionPenaltyLogitsProcessor(LogitsProcessor):
         if not isinstance(penalty, float) or penalty <= 0:
             raise ValueError(f"`penalty` has to be a positive float, but is {penalty}")
 
+        self.penalty_last_n = penalty_last_n
         self.penalty = penalty
         self.prompt_ignore_length = prompt_ignore_length
         self.logits_indices = None
