@@ -352,6 +352,14 @@ class RepetitionPenaltyLogitsProcessor(LogitsProcessor):
             not isinstance(prompt_ignore_length, int) or prompt_ignore_length < 0
         ):
             raise ValueError(f"`prompt_ignore_length` has to be a positive integer, but is {prompt_ignore_length}")
+        
+        penalty_last_n = 64
+        logger.info(f"🔄 Using patched RepetitionPenaltyLogitsProcessor -> RepetitionPenaltyLogitsProcessorPatch | penalty_last_n: {penalty_last_n}")
+        if penalty_last_n is not None:
+            if not isinstance(penalty_last_n, int) or penalty_last_n < 0:
+                raise ValueError(f"`penalty_last_n` has to be a non-negative integer, but is {penalty_last_n}")
+        if not isinstance(penalty, float) or penalty <= 0:
+            raise ValueError(f"`penalty` has to be a positive float, but is {penalty}")
 
         self.penalty = penalty
         self.prompt_ignore_length = prompt_ignore_length
@@ -361,51 +369,55 @@ class RepetitionPenaltyLogitsProcessor(LogitsProcessor):
     def set_continuous_batching_context(self, logits_indices: torch.Tensor, cumulative_seqlens_q: torch.Tensor):
         self.logits_indices = logits_indices
         self.cumulative_seqlens_q = cumulative_seqlens_q
-
+    
     @add_start_docstrings(LOGITS_PROCESSOR_INPUTS_DOCSTRING)
+    @torch.no_grad()
     def __call__(self, input_ids: torch.LongTensor, scores: torch.FloatTensor) -> torch.FloatTensor:
-        if self.prompt_ignore_length:
-            input_ids = input_ids[:, self.prompt_ignore_length :]
+        """
+        Args:
+            input_ids (`torch.LongTensor`):
+                Indices of input sequence tokens in the vocabulary (shape `(batch_size, sequence_length)`).
+            scores (`torch.FloatTensor`):
+                Prediction scores of a language modeling head (shape `(batch_size, vocab_size)`).
 
-        if scores.dim() == 3:
-            if self.logits_indices is not None and self.cumulative_seqlens_q is not None:
-                batch_size, seq_len, vocab_size = scores.shape
-                last_positions = self.logits_indices
-                last_scores = scores[0, last_positions, :]
-
-                # Prepare token mask
-                token_mask = torch.zeros_like(last_scores, dtype=torch.bool)
-                cu_seq_lens = self.cumulative_seqlens_q
-                lengths = cu_seq_lens[1:] - cu_seq_lens[:-1]
-                seq_indices = torch.repeat_interleave(torch.arange(len(lengths), device=input_ids.device), lengths)
-                token_mask[seq_indices, input_ids] = True
-
-                # Apply penalty
-                penalty_scores = torch.where(last_scores < 0, last_scores * self.penalty, last_scores / self.penalty)
-                scores[0, last_positions, :] = torch.where(token_mask, penalty_scores, last_scores)
-            else:
-                batch_size, seq_len, vocab_size = scores.shape
-                last_scores = scores[:, -1, :]
-                token_mask = torch.zeros_like(last_scores, dtype=torch.bool)
-                if input_ids.dim() == 1:
-                    unique_tokens = torch.unique(input_ids)
-                    token_mask.scatter_(1, unique_tokens.unsqueeze(0), True)
-                else:
-                    token_mask.scatter_(1, input_ids, True)
-                # if last_scores < 0 then repetition penalty has to be multiplied to reduce the token probabilities
-                penalty_scores = torch.where(last_scores < 0, last_scores * self.penalty, last_scores / self.penalty)
-                scores[:, -1, :] = torch.where(token_mask, penalty_scores, last_scores)
+        Returns:
+            `torch.FloatTensor`: The modified prediction scores.
+        """
+        # Check if penalties should be applied
+        if self.penalty_last_n == 0 or self.penalty == 1.0:
             return scores
 
-        if input_ids.dim() == 1:
-            input_ids = input_ids.unsqueeze(1)
+        batch_size, seq_len = input_ids.shape
+        vocab_size = scores.shape[-1]
 
-        score = torch.gather(scores, 1, input_ids)
-        # if score < 0 then repetition penalty has to be multiplied to reduce the token probabilities
-        score = torch.where(score < 0, score * self.penalty, score / self.penalty)
-        scores_processed = scores.scatter(1, input_ids, score)
-        return scores_processed
+        # Process each batch item independently
+        for b in range(batch_size):
+            # 1. Determine the penalty window
+            start_index = max(0, seq_len - self.penalty_last_n)
+            window_indices = input_ids[b, start_index:] # Shape: (window_len,)
 
+            if window_indices.numel() == 0: # Skip if window is empty
+                continue
+
+            # 2. Find unique tokens within the window
+            tokens_in_window = set(window_indices.tolist())
+
+            # 3. Apply repetition penalty to the scores for this batch item
+            for token_id in tokens_in_window:
+                if token_id >= vocab_size:
+                    continue 
+
+                logit = scores[b, token_id]
+
+                if logit <= 0:
+                    logit *= self.penalty
+                else:
+                    logit /= self.penalty
+
+                # Update the score
+                scores[b, token_id] = logit
+
+        return scores
 
 class EncoderRepetitionPenaltyLogitsProcessor(LogitsProcessor):
     r"""
