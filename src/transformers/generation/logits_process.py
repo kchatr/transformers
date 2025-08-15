@@ -363,6 +363,11 @@ class RepetitionPenaltyLogitsProcessor(LogitsProcessor):
 
         self.penalty_last_n = penalty_last_n
         self.penalty = penalty
+        # NEW: map any positive penalty to a shrink factor in (0,1]; ensures 0<penalty<1 still penalizes
+        #  - penalty >= 1.0 -> shrink = 1/penalty   (HF behavior)
+        #  - penalty <  1.0 -> shrink = penalty     (still a true penalty)
+        self._shrink = penalty if penalty < 1.0 else (1.0 / penalty)
+
         self.prompt_ignore_length = prompt_ignore_length
         self.logits_indices = None
         self.cumulative_seqlens_q = None
@@ -395,9 +400,9 @@ class RepetitionPenaltyLogitsProcessor(LogitsProcessor):
         for b in range(batch_size):
             # 1. Determine the penalty window
             start_index = max(0, seq_len - self.penalty_last_n)
-            window_indices = input_ids[b, start_index:] # Shape: (window_len,)
+            window_indices = input_ids[b, start_index:]  # Shape: (window_len,)
 
-            if window_indices.numel() == 0: # Skip if window is empty
+            if window_indices.numel() == 0:  # Skip if window is empty
                 continue
 
             # 2. Find unique tokens within the window
@@ -406,14 +411,16 @@ class RepetitionPenaltyLogitsProcessor(LogitsProcessor):
             # 3. Apply repetition penalty to the scores for this batch item
             for token_id in tokens_in_window:
                 if token_id >= vocab_size:
-                    continue 
+                    continue
 
                 logit = scores[b, token_id]
 
-                if logit <= 0:
-                    logit *= self.penalty
+                # CHANGE: always penalize (even when original `penalty` < 1)
+                # positive logits shrink (× shrink), negative logits become more negative (÷ shrink)
+                if logit > 0:
+                    logit = logit * self._shrink
                 else:
-                    logit /= self.penalty
+                    logit = logit / self._shrink
 
                 # Update the score
                 scores[b, token_id] = logit
